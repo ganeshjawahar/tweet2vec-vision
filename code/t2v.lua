@@ -25,6 +25,9 @@ function Tweet2Vec:__init(config)
 	self.model_type=config.model_type
 	self.is_center_target=config.is_center_target
 	self.print_params=config.print_params
+	self.neg_samples=config.neg_samples
+	self.neighbors=config.neighbors
+	self.start_epoch=config.start_epoch
 
 	-- optimization
 	self.learning_rate=config.learning_rate
@@ -47,7 +50,7 @@ function Tweet2Vec:__init(config)
 	utils.buildVocab(self)
 
 	-- Load train set into memory
-	utils.loadTensorsToMemory(self,self.train_file)
+	utils.loadTensorsToMemory(self)
 
 	-- build the net
     self:build_model()
@@ -165,14 +168,55 @@ function Tweet2Vec:train()
 
 		return loss,self.t_grad_params
 	end
+
+	-- Tweet image model params & trainer
+	local i_cur_batch_row=0
+	self.i_optim_state={learningRate=self.learning_rate,alpha=self.decay}
+	self.i_params,self.i_grad_params=self.tweetModel:getParameters()
+	self.i_feval=function(x)
+		-- Get new params
+		self.i_params:copy(x)
+
+		-- Reset gradients
+		self.i_grad_params:zero()
+
+		-- loss is average of all criterions
+		local loss=0
+		local last_sample=math.min(self.i_cur_batch+self.batch_size-1,self.im_size)
+		local count=0
+		for i=self.i_cur_batch,last_sample do
+			-- estimate f
+			local input={self.image_context_tensors[i],self.image_target_tensors[i]}
+			local output=self.imgModel:forward(input)
+			local err=self.criterion2:forward(output,self.img_model_label_tensor)
+			loss=loss+err
+
+			-- estimate df/dW
+			local bk=self.criterion2:backward(output,self.img_model_label_tensor)
+			self.imgModel:backward(input,bk)
+			count=count+1
+		end
+
+		loss=loss/count
+		self.i_grad_params:div(count)
+
+		self.i_grad_params:clamp(-self.grad_clip,self.grad_clip)
+
+		--regularization
+		loss=loss+0.5*self.reg*self.i_grad_params:norm()^2
+
+		return loss,self.i_grad_params
+	end
+
 	for epoch=1,self.max_epochs do
 		local epoch_start=sys.clock()
 		local w_epoch_loss=0
 		local w_epoch_iteration=0
 		local t_epoch_loss=0
 		local t_epoch_iteration=0
+		local i_epoch_loss=0
+		local i_epoch_iteration=0
 
-		--[[
 		-- Modeling word likelihood
 		print('Modeling word likelihood...')
 		for index=1,self.wm_size,self.batch_size do
@@ -183,7 +227,7 @@ function Tweet2Vec:train()
 			w_epoch_iteration=w_epoch_iteration+1
 		end
 		xlua.progress(self.wm_size,self.wm_size)
-		]]--
+		print(string.format("Word loss=%f\n",(w_epoch_loss/w_epoch_iteration)))
 
 		-- Modeling tweet likelihood
 		print('Modeling tweet likelihood...')
@@ -195,8 +239,28 @@ function Tweet2Vec:train()
 			t_epoch_iteration=t_epoch_iteration+1
 		end
 		xlua.progress(self.tm_size,self.tm_size)
+		print(string.format("Tweet textual loss=%f\n",(t_epoch_loss/t_epoch_iteration)))
 
-		print(string.format("Epoch %d done in %.2f minutes. word loss=%f tweet loss=%f\n\n",epoch,((sys.clock()-epoch_start)/60),(w_epoch_loss/w_epoch_iteration),(t_epoch_loss/t_epoch_iteration)))
+		if epoch>=self.start_epoch then
+			-- Load the image batches, if not done before
+			if epoch==self.start_epoch then
+				utils.loadImageTensors(self)
+			end
+
+			-- Modeling image features
+			print('Modeling image features...')
+			for index=1,self.im_size,self.batch_size do
+				xlua.progress(index,self.im_size)
+				self.i_cur_batch=index
+				local _,loss=optim.sgd(self.i_feval,self.i_params,self.i_optim_state)
+				i_epoch_loss=i_epoch_loss+loss[1]
+				i_epoch_iteration=i_epoch_iteration+1
+			end
+			xlua.progress(self.im_size,self.im_size)
+			print(string.format("Tweet visual loss=%f\n",(i_epoch_loss/i_epoch_iteration)))
+		end
+
+		print(string.format("Epoch %d done in %.2f minutes.\n\n",epoch,((sys.clock()-epoch_start)/60)))
 	end
 	print(string.format("Training done in %.2f minutes.",((sys.clock()-start)/60)))
 end
@@ -276,9 +340,25 @@ function Tweet2Vec:build_model()
 		self.tweetModel2=self.tweetModel2Part
 		self.tweetModel2:add(nn.Linear(self.wdim,self.corpus_size))
 		self.tweetModel2:add(nn.LogSoftMax())
-	end	
+	end
 
 	self.tweetModel=nn.Parallel():add(self.weightPredModel):add(self.tweetModel1):add(self.tweetModel2)
+
+	if self.model_type=='t2v-v-naive' or self.model_type=='t2v-v-smart' then
+		self.targetModel=nn.Sequential()		
+		local tweet_vecs_clone_3=self.tweet_vecs:clone()
+		self.tweet_vecs:share(tweet_vecs_clone_3,"weight","bias","gradWeight","gradBias")
+		self.targetModel:add(tweet_vecs_clone_3)
+		self.targetModel:add(nn.Linear(self.wdim,4096))		
+		self.imgModel=nn.Sequential()
+		self.imgModel:add(nn.ParallelTable())
+		self.imgModel.modules[1]:add(nn.Identity())
+		self.imgModel.modules[1]:add(self.targetModel)
+		self.imgModel:add(nn.MM(false,true))
+		self.imgModel:add(nn.Sigmoid())
+		self.tweetModel:add(imgModel)
+		self.criterion2=nn.BCECriterion()
+	end
 
 	-- Define the criterion
 	if self.softmaxtree==1 then
@@ -307,4 +387,8 @@ function Tweet2Vec:cuda()
 	self.weightPredModel=self.weightPredModel:cuda()
 	self.tweetModel1=self.tweetModel1:cuda()
 	self.tweetModel2=self.tweetModel2:cuda()
+	if self.model_type=='t2v-v-naive' or self.model_type=='t2v-v-smart' then
+		self.imgModel=self.imgModel:cuda()		
+		self.criterion2=self.criterion2:cuda()
+	end
 end

@@ -87,7 +87,7 @@ end
 
 -- Function to split a string by given char.
 function utils.splitByChar(str,inSplitPattern)
-	utils.trim(str)
+	str=utils.trim(str)
 	outResults={}
 	local theStart = 1
 	local theSplitStart,theSplitEnd=string.find(str,inSplitPattern,theStart)
@@ -282,28 +282,33 @@ function utils.convertTo1DTensor(str)
 end
 
 -- Function to load train set into memory
-function utils.loadDataToMemory(config,file)
+function utils.loadDataToMemory(config)
 	config.user_map={}
 	config.key_list={}
-	config.index2tweet={}
-	for line in io.lines(file) do
+	config.index2tweettext={}
+	config.index2tweetid={}
+	config.tweet2index={}
+	for line in io.lines(config.train_file) do
 		local content=utils.splitByChar(line,'\t')
 		if #content>=4 then
 			local key=content[1]
-			local tweet=content[4]
+			local tweet_text=content[4]
+			local tweet_id=content[2]
 			if config.user_map[key]==nil then
 				config.user_map[key]={}
 				config.key_list[#config.key_list+1]=key
 			end
-			config.index2tweet[#config.index2tweet+1]=tweet
-			table.insert(config.user_map[key],#config.index2tweet)
+			config.index2tweettext[#config.index2tweettext+1]=tweet_text
+			table.insert(config.user_map[key],#config.index2tweettext)
+			config.index2tweetid[#config.index2tweetid+1]=tweet_id
+			config.tweet2index[tweet_id]=#config.index2tweetid
 		end	
 	end
 end
 
 -- Function to load train set into memory
-function utils.loadTensorsToMemory(config,file)
-	utils.loadDataToMemory(config,file)
+function utils.loadTensorsToMemory(config)
+	utils.loadDataToMemory(config)
 	local pad=0
 	if config.pad_tweet==1 then pad=((config.wwin-1)/2) end
 
@@ -317,7 +322,7 @@ function utils.loadTensorsToMemory(config,file)
 		local data=config.user_map[key]
 		for tweet_index=1,#data do
 			local t_id=data[tweet_index]
-			local tweet_text=config.index2tweet[t_id]
+			local tweet_text=config.index2tweettext[t_id]
 			local windows=utils.getWordWindows(tweet_text,pad,config.wwin,config.word2index,config.is_center_target)
 			for wi,window in ipairs(windows) do
 				table.insert(w_i_1,window[1])
@@ -364,7 +369,152 @@ function utils.loadTensorsToMemory(config,file)
 	w_o=nil
 	t_i=nil
 	t_o=nil
+	collectgarbage()
+end
 
+-- Function to sample image contexts
+function utils.sample_image_contexts(config,context)
+	local contexts=torch.Tensor(1+config.neg_samples,4096)
+	contexts[1]=config.img_tensors[context]
+	local i=0
+	while i<config.neg_samples do
+		neg_context=torch.random(#config.index2img)
+		if context~=neg_context then
+			contexts[i+2]=config.img_tensors[neg_context]
+			i=i+1
+		end
+	end
+	return contexts
+end
+
+-- Function to load image tensors
+function utils.loadImageTensors(config)
+	-- Load the image tensors
+	config.img_tensors={}
+	config.index2img={}
+	config.img2index={}
+	print('Loading image tensors...')
+	start=sys.clock()
+	count=0
+	for line in io.lines(config.img_feat_file) do
+		local content=utils.splitByChar(line,'\t')
+		local imgId=content[1]
+		config.index2img[#config.index2img+1]=imgId
+		config.img2index[imgId]=#config.index2img
+		local tensor=torch.Tensor(#content-1)
+		for i=1,#content-1 do
+			tensor[i]=tonumber(content[i+1])
+		end
+		table.insert(config.img_tensors,tensor)
+		count=count+1
+	end
+	print(string.format("Done in %.2f seconds.",sys.clock()-start))
+
+	-- Load the image batches
+	print('Loading image batches...')
+	start=sys.clock()
+	config.image_context_tensors={}
+	config.image_target_tensors={}
+	config.img_model_label_tensor=torch.zeros(1+config.neg_samples); config.img_model_label_tensor[1]=1;
+	local vt,nvt=0,0
+	for line in io.lines(config.train_file) do
+		local content=utils.splitByChar(line,'\t')
+		if #content>=5 then
+			-- considering tweets with images only
+			for i=5,#content do
+				local imgUrl=content[i]
+				local idx=config.img2index[imgUrl]
+				if idx~=nil then
+					local tweetId=content[2]
+					if config.model_type=='t2v-v-naive' or (config.model_type=='t2v-v-smart' and utils.isVisualTweet(config,config.tweet2index[tweetId],idx)==true) then
+						table.insert(config.image_context_tensors,utils.sample_image_contexts(config,idx))
+						table.insert(config.image_target_tensors,torch.IntTensor{config.tweet2index[tweetId]})
+						vt=vt+1
+					else
+						nvt=nvt+1
+					end					
+				end				
+			end
+		end
+	end
+	config.im_size=#config.image_target_tensors
+	print(string.format("Found Visual=%d & Non-Visual=%d image batches.",vt,nvt))
+	print(string.format("Done in %.2f seconds.",sys.clock()-start))
+
+	-- Clean the memory
+	config.img_tensors=nil
+	collectgarbage()
+end
+
+-- Function to check if the tweet is visual or not
+function utils.isVisualTweet(config,tweetId,imgId)
+	-- Find K-nearest image-tweets
+	if config.image_tweets==nil then
+		utils.populateImageTweets(config)
+	end
+	local neighbors=utils.getKNearestTweets(config,tweetId)
+
+	-- Compute the dispersion and median score
+	local score,median=utils.computeDispersionScore(config,neighbors,imgId)
+	if score<median then
+		return true
+	end
+	return false
+end
+
+-- Function to compute image dispersion score
+function utils.computeDispersionScore(config,neighbors,targetImageId)
+	local target_img_feat=config.img_tensors[targetImageId]
+	local score=0
+	local median=-1
+	for i,content in ipairs(neighbors) do
+		local sim=(1-nn.CosineDistance():forward({config.img_tensors[content],target_img_feat})[1])
+		score=score+sim
+		if i==torch.ceil(#neighbors/2) then
+			median=sim
+		end
+	end
+	score=score/#neighbors
+	return score,median
+end
+
+-- Function to find k-nearest tweets by textual similarity (cosine)
+function utils.getKNearestTweets(config,tweetId)
+	local tensor=torch.Tensor(#config.image_tweets-1) -- exclude the target tweet
+	local cur_tweet=config.tweet_vecs.weight[tweetId]
+	-- Compute the cosine similarity
+	local seqList={}
+	for i,content in ipairs(config.image_tweets) do
+		local tweetSeqNo=content[1]
+		if tweetSeqNo~=tweetId then
+			table.insert(seqList,tweetSeqNo)
+			tensor[#seqList]=nn.CosineDistance():forward({config.tweet_vecs.weight[tweetSeqNo],cur_tweet})
+		end
+	end
+	-- Find the k-nearest tweets
+	local result={}
+	local score,order=torch.sort(tensor,true)  -- Setting 'true' to sort in descending order.
+	for i=1,config.neighbors do
+		table.insert(result,seqList[order[i]])
+	end
+	seqList=nil
+	return result
+end
+
+-- Function to populate image tweets
+function utils.populateImageTweets(config)
+	config.image_tweets={}
+	for line in io.lines(config.train_file) do
+		local content=utils.splitByChar(line,'\t')
+		if #content>=5 then
+			-- considering tweets with images only
+			local imgUrl=content[5]
+			local idx=config.img2index[imgUrl]
+			if idx~=nil then
+				table.insert(config.image_tweets,{config.tweet2index[content[2]],idx})
+			end
+		end
+	end
 end
 
 -- Function to get temporal context of a tweet

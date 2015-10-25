@@ -35,12 +35,15 @@ cmd:option('-min_freq',5,'words that occur less than <int> times will not be tak
 cmd:option('-pad_tweet',1,'should we need to pad the tweet ?')
 cmd:option('-is_center_target',1,'model center element based on its surrounding words?')
 cmd:option('-pre_train',0,'initialize word embeddings with pre-trained vectors?')
-cmd:option('-model_type','t2v','tweet2vec basic or vision model')
+cmd:option('-model_type','t2v-v-smart','t2v or t2v-v-naive or t2v-v-smart')
+cmd:option('-neg_samples',10,'while modeling vision features how many negative samples must be considered?')
+cmd:option('-neighbors',5,'# nearest neighbors to be considered for compute the visual score')
+cmd:option('-start_epoch',2,'epoch after which the model starts learning from visual features')
 -- optimization
 cmd:option('-learning_rate',0.01,'learning rate')
 cmd:option('-grad_clip',0.01,'clip gradients at this value')
 cmd:option('-batch_size',50,'number of sequences to train on in parallel')
-cmd:option('-max_epochs',1,'number of full passes through the training data')
+cmd:option('-max_epochs',3,'number of full passes through the training data')
 cmd:option('-reg',1e-4,'regularization parameter l2-norm')
 cmd:option('-softmaxtree',1,'use SoftmaxTree instead of the inefficient (full) softmax')
 -- GPU/CPU
@@ -66,4 +69,4 @@ model=Tweet2Vec(params)
 model:train()
 
 -- evaluate the model
-model:evaluate()
+--model:evaluate()
