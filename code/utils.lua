@@ -287,7 +287,9 @@ function utils.loadDataToMemory(config)
 	config.key_list={}
 	config.index2tweettext={}
 	config.index2tweetid={}
-	config.tweet2index={}
+	config.tweet2index={}	
+	config.word_model_size=0
+	config.word_model_pad=0; if config.pad_tweet==1 then config.word_model_pad=((config.wwin-1)/2) end
 	for line in io.lines(config.train_file) do
 		local content=utils.splitByChar(line,'\t')
 		if #content>=4 then
@@ -302,74 +304,17 @@ function utils.loadDataToMemory(config)
 			table.insert(config.user_map[key],#config.index2tweettext)
 			config.index2tweetid[#config.index2tweetid+1]=tweet_id
 			config.tweet2index[tweet_id]=#config.index2tweetid
-		end	
-	end
-end
-
--- Function to load train set into memory
-function utils.loadTensorsToMemory(config)
-	utils.loadDataToMemory(config)
-	local pad=0
-	if config.pad_tweet==1 then pad=((config.wwin-1)/2) end
-
-	local w_i_1={}
-	local w_i_2={}
-	local w_o={}
-	local total=#config.key_list
-	local indices=torch.randperm(total)
-	for index=1,total do
-		local key=config.key_list[indices[index]]
-		local data=config.user_map[key]
-		for tweet_index=1,#data do
-			local t_id=data[tweet_index]
-			local tweet_text=config.index2tweettext[t_id]
-			local windows=utils.getWordWindows(tweet_text,pad,config.wwin,config.word2index,config.is_center_target)
-			for wi,window in ipairs(windows) do
-				table.insert(w_i_1,window[1])
-				table.insert(w_i_2,t_id)
-				table.insert(w_o,window[2])
-			end
+			-- Update the word model size
+			config.word_model_size=config.word_model_size+((#utils.getNgrams(tweet_text,1,config.word_model_pad))-config.wwin+1)
 		end
 	end
-	
-	local t_i={}
-	local t_o={}
-	indices=torch.randperm(total)
-	for index=1,total do
-		local key=config.key_list[indices[index]]
-		local data=config.user_map[key]
-		local windows=utils.getTweetWindows(data,config.twin,config.corpus_size,1)
-		for wi,window in ipairs(windows) do
-			table.insert(t_i,window[1])
-			table.insert(t_o,window[2])
-		end
+	-- Update the tweet model size
+	config.tweet_model_size=0
+	config.tweet_model_pad=((config.twin-1)/2);
+	for _,tweet_list in pairs(config.user_map) do
+		config.tweet_model_size=config.tweet_model_size+((#tweet_list)-config.twin+1)
 	end
-
-	-- Create the tensors	
-	config.word_model_word_context=torch.IntTensor(#w_i_1,config.wwin-1)
-	config.word_model_tweet_target=torch.IntTensor(#w_i_2,1)
-	config.word_model_word_target=torch.IntTensor(#w_o,1)
-	config.tweet_model_context=torch.IntTensor(#t_i,config.twin-1)
-	config.tweet_model_target=torch.IntTensor(#t_o,1)
-	for i=1,#w_i_1 do
-		config.word_model_word_context[i]=w_i_1[i]
-		config.word_model_tweet_target[i]=w_i_2[i]
-		config.word_model_word_target[i]=w_o[i]
-	end
-	for j=1,#t_i do
-		config.tweet_model_context[j]=t_i[j]
-		config.tweet_model_target[j]=t_o[j]
-	end
-
-	-- Clean the memory
-	config.wm_size=#w_i_1
-	config.tm_size=#t_i
-	w_i_1=nil
-	w_i_2=nil
-	w_o=nil
-	t_i=nil
-	t_o=nil
-	collectgarbage()
+	print(string.format('Word_Model #Iterations = %d; Tweet_Model #Iterations = %d;',config.word_model_size,config.tweet_model_size))
 end
 
 -- Function to sample image contexts
@@ -408,7 +353,7 @@ function utils.loadImageTensors(config)
 		table.insert(config.img_tensors,tensor)
 		count=count+1
 	end
-	print(string.format("Done in %.2f seconds.",sys.clock()-start))
+	print(string.format("%d image features loaded. Done in %.2f seconds.",#config.img_tensors,sys.clock()-start))
 
 	-- Load the image batches
 	print('Loading image batches...')
@@ -416,6 +361,8 @@ function utils.loadImageTensors(config)
 	config.image_context_tensors={}
 	config.image_target_tensors={}
 	config.img_model_label_tensor=torch.zeros(1+config.neg_samples); config.img_model_label_tensor[1]=1;
+	if config.gpu==1 then config.img_model_label_tensor=config.img_model_label_tensor:cuda() end
+	local fptr=io.open('vis-tweets','w')
 	local vt,nvt=0,0
 	for line in io.lines(config.train_file) do
 		local content=utils.splitByChar(line,'\t')
@@ -427,17 +374,32 @@ function utils.loadImageTensors(config)
 				if idx~=nil then
 					local tweetId=content[2]
 					if config.model_type=='t2v-v-naive' or (config.model_type=='t2v-v-smart' and utils.isVisualTweet(config,config.tweet2index[tweetId],idx)==true) then
-						table.insert(config.image_context_tensors,utils.sample_image_contexts(config,idx))
-						table.insert(config.image_target_tensors,torch.IntTensor{config.tweet2index[tweetId]})
+						local context=utils.sample_image_contexts(config,idx)
+						local target=torch.IntTensor{config.tweet2index[tweetId]}
+						if config.gpu==1 then
+							context=context:cuda()
+							target=target:cuda()
+						end
+						table.insert(config.image_context_tensors,context)
+						table.insert(config.image_target_tensors,target)
+						fptr:write(imgUrl..'\n')
 						vt=vt+1
 					else
 						nvt=nvt+1
 					end					
 				end				
 			end
+			if (vt+nvt)%50==0 then
+				collectgarbage()
+			end
+			if (vt+nvt)%2==0 then
+				xlua.progress((vt+nvt),#config.img_tensors)
+			end
 		end
 	end
+	fptr:close()
 	config.im_size=#config.image_target_tensors
+	xlua.progress((vt+nvt),#config.img_tensors)
 	print(string.format("Found Visual=%d & Non-Visual=%d image batches.",vt,nvt))
 	print(string.format("Done in %.2f seconds.",sys.clock()-start))
 
@@ -487,8 +449,8 @@ function utils.getKNearestTweets(config,tweetId)
 	for i,content in ipairs(config.image_tweets) do
 		local tweetSeqNo=content[1]
 		if tweetSeqNo~=tweetId then
-			table.insert(seqList,tweetSeqNo)
-			tensor[#seqList]=nn.CosineDistance():forward({config.tweet_vecs.weight[tweetSeqNo],cur_tweet})
+			table.insert(seqList,content[2])
+			tensor[#seqList]=config.distance:forward({config.tweet_vecs.weight[tweetSeqNo],cur_tweet})[1]
 		end
 	end
 	-- Find the k-nearest tweets
@@ -498,6 +460,7 @@ function utils.getKNearestTweets(config,tweetId)
 		table.insert(result,seqList[order[i]])
 	end
 	seqList=nil
+	tensor=nil
 	return result
 end
 
